@@ -2068,43 +2068,49 @@ async function runMain() {
                         break;
                     }
 
-                    // 【ALTCHA 前置检测】modal text 含 ALTCHA 关键词时，必须先完成 checkbox 才能点 confirm
+                    // 【ALTCHA 前置检测】兼容可见 checkbox 与隐藏的 auto="onsubmit" 模式
                     const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
                         || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    const altchaAutoOnSubmit = hasAltchaInModal
+                        && await modal.locator('altcha-widget[auto="onsubmit"]').count().catch(() => 0) > 0;
                     if (hasAltchaInModal) {
-                        console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
-                        const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
-                        console.log(`[ALTCHA] checkbox checked before click: ${cbCheckedBefore}`);
+                        if (altchaAutoOnSubmit) {
+                            console.log('[ALTCHA] 检测到 auto="onsubmit" 模式，跳过 checkbox 前置点击，交给表单提交时后台验证。');
+                        } else {
+                            console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
+                            const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
+                            console.log(`[ALTCHA] checkbox checked before click: ${cbCheckedBefore}`);
 
-                        if (!cbCheckedBefore) {
-                            console.log('[ALTCHA] trying click strategy: auto');
-                            const cbClicked = await tryClickCaptchaCheckbox(page, modal);
-                            if (cbClicked) {
-                                console.log('[ALTCHA] 自动点击完成，等待 3 秒验证...');
-                                await page.waitForTimeout(3000);
-                                const cbCheckedAfter = await isAltchaCheckboxChecked(page, modal);
-                                console.log(`[ALTCHA] checkbox checked after click: ${cbCheckedAfter}`);
-                                if (!cbCheckedAfter) {
-                                    console.log('[ALTCHA] 点击后 checkbox 仍未勾选，标记 captcha_required。');
+                            if (!cbCheckedBefore) {
+                                console.log('[ALTCHA] trying click strategy: auto');
+                                const cbClicked = await tryClickCaptchaCheckbox(page, modal);
+                                if (cbClicked) {
+                                    console.log('[ALTCHA] 自动点击完成，等待 3 秒验证...');
+                                    await page.waitForTimeout(3000);
+                                    const cbCheckedAfter = await isAltchaCheckboxChecked(page, modal);
+                                    console.log(`[ALTCHA] checkbox checked after click: ${cbCheckedAfter}`);
+                                    if (!cbCheckedAfter) {
+                                        console.log('[ALTCHA] 点击后 checkbox 仍未勾选，标记 captcha_required。');
+                                        runStatus = 'captcha_required';
+                                        blockMessage = 'ALTCHA checkbox click did not result in checked state';
+                                        renewSuccess = false;
+                                        const photoDir = await ensureScreenshotsDir();
+                                        await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
+                                        break;
+                                    }
+                                    console.log('[ALTCHA] ✅ Checkbox 已勾选，可以点击 confirm。');
+                                } else {
+                                    console.log('[ALTCHA] 所有点击策略均失败，标记 captcha_required。');
                                     runStatus = 'captcha_required';
-                                    blockMessage = 'ALTCHA checkbox click did not result in checked state';
+                                    blockMessage = 'ALTCHA checkbox could not be auto-clicked';
                                     renewSuccess = false;
                                     const photoDir = await ensureScreenshotsDir();
                                     await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
                                     break;
                                 }
-                                console.log('[ALTCHA] ✅ Checkbox 已勾选，可以点击 confirm。');
                             } else {
-                                console.log('[ALTCHA] 所有点击策略均失败，标记 captcha_required。');
-                                runStatus = 'captcha_required';
-                                blockMessage = 'ALTCHA checkbox could not be auto-clicked';
-                                renewSuccess = false;
-                                const photoDir = await ensureScreenshotsDir();
-                                await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                                break;
+                                console.log('[ALTCHA] checkbox 已经勾选，直接点击 confirm。');
                             }
-                        } else {
-                            console.log('[ALTCHA] checkbox 已经勾选，直接点击 confirm。');
                         }
                     }
 
@@ -2119,8 +2125,22 @@ async function runMain() {
                     await confirmBtn.click();
                     console.log('Confirm Renew clicked.');
 
-                    // 点击后等待响应
-                    await page.waitForTimeout(2000);
+                    // auto="onsubmit" 会先异步完成 challenge，再真正提交表单。
+                    if (altchaAutoOnSubmit) {
+                        console.log('[ALTCHA] 等待后台 challenge 与表单提交（最多 20 秒）...');
+                        const deadline = Date.now() + 20000;
+                        while (Date.now() < deadline) {
+                            const currentUrl = page.url();
+                            const modalVisible = await modal.isVisible().catch(() => false);
+                            if (/renew=(success|error|failed)/i.test(currentUrl) || !modalVisible) {
+                                console.log(`[ALTCHA] 后台提交已推进，URL: ${currentUrl}，modal visible: ${modalVisible}`);
+                                break;
+                            }
+                            await page.waitForTimeout(500);
+                        }
+                    } else {
+                        await page.waitForTimeout(2000);
+                    }
 
                     // --- 点击后诊断序列 ---
                     const pageTextAfterClick = await getPageText(page);
@@ -2148,6 +2168,14 @@ async function runMain() {
                     const captchaIssue = detectCaptchaRequired(pageTextAfterClick);
                     if (captchaIssue) {
                         console.log(`   >> ⚠️ 检测到验证码阻断: ${captchaIssue}`);
+                        if (altchaAutoOnSubmit) {
+                            runStatus = 'captcha_required';
+                            blockMessage = captchaIssue;
+                            renewSuccess = false;
+                            const photoDir = await ensureScreenshotsDir();
+                            await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
+                            break;
+                        }
                         console.log('   >> 尝试自动点击 checkbox...');
                         const cbClicked = await tryClickCaptchaCheckbox(page, modal);
                         if (cbClicked) {
@@ -2242,7 +2270,16 @@ async function runMain() {
                         }
                     }
 
-                    // 检查 3: 成功文本
+                    // 检查 3: URL 或页面成功文本
+                    if (/renew=success/i.test(currentUrlAfterClick)) {
+                        console.log('   >> ✅ URL 显示 renew=success，续期成功！');
+                        runStatus = 'success';
+                        renewSuccess = true;
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `renew_success_${attempt}.png`), fullPage: true });
+                        break;
+                    }
+
                     const successText = detectRenewSuccess(pageTextAfterClick);
                     if (successText) {
                         console.log('   >> ✅ 页面出现成功提示！');
