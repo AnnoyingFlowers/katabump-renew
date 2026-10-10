@@ -24,7 +24,7 @@ function parsePositiveNumber(value, fallback) {
 
 const PROXY_COOLDOWN_HOURS = parsePositiveNumber(
     process.env.PROXY_COOLDOWN_HOURS,
-    26
+    6
 );
 const CONFIGURED_MAX_PROXY_SWITCHES = parsePositiveNumber(
     process.env.MAX_PROXY_SWITCHES,
@@ -111,6 +111,15 @@ function isRealProxyNetworkFailure(attempt) {
     );
 }
 
+function isTurnstile600010Failure(attempt) {
+    return Boolean(
+        attempt &&
+        attempt.code === EXIT_CODE.PROXY_RETRY &&
+        attempt.status === 'login_captcha_required' &&
+        /\b600010\b/.test(attempt.message || '')
+    );
+}
+
 function makeAttemptRecord(attempt, parsed, childResult) {
     const actionResult = childResult.actionResult || {};
     const code = Number.isInteger(actionResult.exitCode) ? actionResult.exitCode : childResult.code;
@@ -135,7 +144,7 @@ function buildFinalSummary(finalCode, finalResult, attempts, maxAttempts = attem
     const directFallbackAttempted = Boolean(directFallbackRecord);
     let status = actionResult.status || actionStatusFromCode(finalCode);
     if (finalCode === EXIT_CODE.NO_PROXY_AVAILABLE) status = 'no_proxy_available';
-    if (finalCode === EXIT_CODE.FATAL && attempts.length > 0 && attempts.every(item => item.code === EXIT_CODE.PROXY_RETRY)) {
+    if (finalCode === EXIT_CODE.FATAL && status !== 'turnstile_blocked' && attempts.length > 0 && attempts.every(item => item.code === EXIT_CODE.PROXY_RETRY)) {
         status = 'proxy_exhausted';
     }
 
@@ -178,6 +187,7 @@ function formatFinalNotification(summary) {
         no_proxy_available: '❌ KataBump 无可用代理',
         proxy_exhausted: '❌ KataBump 代理已耗尽',
         proxy_retry: '❌ KataBump 代理重试失败',
+        turnstile_blocked: '⚠️ KataBump Turnstile 验证受阻',
         error: '❌ KataBump 自动续期失败'
     };
     const lines = [
@@ -601,6 +611,7 @@ async function runProxyWorkflow(attempts) {
     console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，冷却后候选 ${candidates.length} 条，本轮最多检查 ${maxAttempts} 条`);
 
     let directFallbackAttempted = false;
+    let turnstile600010Count = 0;
 
     if (!proxyResult.configured) {
         const directResult = await runActionRenew(null, 1);
@@ -677,6 +688,24 @@ async function runProxyWorkflow(attempts) {
         }
 
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
+            if (isTurnstile600010Failure(attemptRecord)) {
+                turnstile600010Count++;
+                console.log(`[proxy-runner] Turnstile 600010 (${turnstile600010Count}/2)：属于验证码失败，不将该代理加入网络故障冷却`);
+                if (turnstile600010Count >= 2) {
+                    console.log('[proxy-runner] 两个不同代理均遇到 600010，停止本轮，避免耗尽全部代理');
+                    return finalizeWorkflow(EXIT_CODE.FATAL, {
+                        ...attemptRecord,
+                        status: 'turnstile_blocked',
+                        message: 'Cloudflare Turnstile 600010 on two proxies; stopped without cooling down proxies'
+                    }, attempts, maxAttempts);
+                }
+                console.log('[proxy-runner] 尝试下一个代理确认是否为共同验证问题');
+                continue;
+            }
+            if (attemptRecord.status === 'login_captcha_required') {
+                console.log('[proxy-runner] 登录验证码失败不是已确认的代理网络故障，不加入网络冷却，尝试下一个代理');
+                continue;
+            }
             const parsed = selection;
             const key = proxyKey(parsed);
             addCooldown(cooldowns, key, 'proxy_retry_from_action_renew');
@@ -761,6 +790,7 @@ module.exports = {
     parsePositiveNumber,
     normalizeFinalCode,
     isRealProxyNetworkFailure,
+    isTurnstile600010Failure,
     getMaxProxyAttempts,
     buildProxyCandidateQueue,
     calculateCooldownUntil,
