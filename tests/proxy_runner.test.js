@@ -220,6 +220,16 @@ function tests() {
     }));
     assert.strictEqual(mod.isRealProxyNetworkFailure(proxyFailureAttempts[0]), true);
     assert.strictEqual(mod.isRealProxyNetworkFailure({ ...proxyFailureAttempts[0], status: 'login_captcha_required' }), false);
+    assert.strictEqual(mod.isTurnstile600010Failure({ code: 42, status: 'login_captcha_required', message: 'Turnstile adapter error 600010' }), true);
+    assert.strictEqual(mod.isTurnstile600010Failure({ code: 42, status: 'proxy_retry', message: 'network failure 600010' }), false);
+    assert.strictEqual(mod.isTurnstile600010Failure({ code: 42, status: 'login_captcha_required', message: 'Turnstile token missing' }), false);
+    assert.strictEqual(mod.isTurnstile600010Failure({ code: 0, status: 'login_captcha_required', message: '600010' }), false);
+    const blockedSummary = mod.buildFinalSummary(1, {
+        ...retryAttempt, status: 'turnstile_blocked', message: 'Cloudflare Turnstile 600010'
+    }, [retryAttempt, retryAttempt]);
+    assert.strictEqual(blockedSummary.status, 'turnstile_blocked');
+    assert.ok(mod.formatFinalNotification(blockedSummary).includes('Turnstile 验证受阻'));
+
     const directNotReady = {
         attempt: 11,
         proxy: 'direct',
@@ -286,15 +296,15 @@ function tests() {
     assert.strictEqual(mod.getMaxProxyAttempts(10, null), 10);
     assert.strictEqual(mod.getMaxProxyAttempts(10, 4), 4);
 
-    // 26 小时冷却应跨过次日，且过期前不能重新进入候选队列。
+    // 网络故障默认冷却 6 小时，过期前不能重新进入候选队列。
     const cooldownStart = Math.floor(new Date('2026-07-24T02:00:00.000Z').getTime() / 1000);
     assert.strictEqual(
         mod.calculateCooldownUntil(cooldownStart) - cooldownStart,
-        26 * 60 * 60
+        6 * 60 * 60
     );
     assert.strictEqual(
         new Date(mod.calculateCooldownUntil(cooldownStart) * 1000).toISOString(),
-        '2026-07-25T04:00:00.000Z'
+        '2026-07-24T08:00:00.000Z'
     );
     const restoredCooldowns = {
         '4.4.4.4:8080': { until: Math.floor(Date.now() / 1000) + 3600, reason: 'restored' }
