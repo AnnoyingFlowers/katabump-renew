@@ -1,0 +1,123 @@
+name: KataBump Network Diagnostic
+
+on:
+  push:
+    paths:
+      - .github/workflows/network-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install existing browser dependencies
+        run: |
+          npm ci
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb > /dev/null
+      - name: Compare direct and Webshare (no login / no captcha click)
+        env:
+          WEBSHARE_PROXY_LIST_URL: ${{ secrets.WEBSHARE_PROXY_LIST_URL }}
+        run: |
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' node <<'NODE'
+          const { spawnSync } = require('child_process');
+          const { chromium } = require('playwright');
+          const { parseProxyLine } = require('./proxy_runner');
+          
+          function runCurl(label, url, proxy) {
+            const args = ['-sS', '-L', '--max-time', '12', '-o', '/dev/null', '-w', '%{http_code} %{time_total}'];
+            if (proxy) {
+              args.push('--proxy', 'http://' + proxy.ip + ':' + proxy.port, '--proxy-user', proxy.username + ':' + proxy.password);
+            } else {
+              args.push('--noproxy', '*');
+            }
+            args.push(url);
+            const r = spawnSync('curl', args, { encoding: 'utf8', timeout: 16000 });
+            const parts = String(r.stdout || '').trim().split(' ');
+            console.log('[http] ' + label + ' ' + new URL(url).hostname +
+              ' status=' + (parts[0] || 'none') +
+              ' seconds=' + (parts[1] || '?') + ' curl_exit=' + (r.status ?? 'timeout'));
+          }
+          
+          async function probeBrowser(label, proxy) {
+            let browser;
+            try {
+              const opts = {
+                executablePath: '/usr/bin/google-chrome',
+                headless: false,
+                args: ['--no-sandbox', '--disable-dev-shm-usage']
+              };
+              if (proxy) opts.proxy = {
+                server: 'http://' + proxy.ip + ':' + proxy.port,
+                username: proxy.username,
+                password: proxy.password
+              };
+              browser = await chromium.launch(opts);
+              const page = await browser.newPage({ viewport: {width: 1280, height: 720} });
+              let cfError = 'none';
+              page.on('console', m => {
+                const match = m.text().match(/\b(600\d{3}|200500)\b/);
+                if (match) cfError = match[1];
+              });
+              page.on('pageerror', e => {
+                const match = e.message.match(/\b(600\d{3}|200500)\b/);
+                if (match) cfError = match[1];
+              });
+              const response = await page.goto('https://dashboard.katabump.com/auth/login', {
+                waitUntil: 'domcontentloaded', timeout: 25000
+              });
+              await page.waitForTimeout(5000);
+              const frames = page.frames().filter(f => /challenges\.cloudflare\.com/i.test(f.url())).length;
+              const fields = await page.locator('[name="cf-turnstile-response"]').count();
+              console.log('[chrome] ' + label + ' http=' + (response?.status() ?? 'none') +
+                ' turnstile_frames=' + frames + ' response_fields=' + fields +
+                ' client_error=' + cfError + ' note=no_click_no_login');
+            } catch (e) {
+              console.log('[chrome] ' + label + ' probe_failed=' +
+                String(e.message || e).replace(/\s+/g,' ').substring(0,150));
+            } finally {
+              if (browser) await browser.close().catch(() => {});
+            }
+          }
+          
+          (async () => {
+            const version = spawnSync('/usr/bin/google-chrome', ['--version'], {encoding:'utf8'});
+            console.log('[chrome] version=' + String(version.stdout || '').trim());
+            const url = process.env.WEBSHARE_PROXY_LIST_URL;
+            const proxies = [];
+            if (url) {
+              const list = spawnSync('curl', ['-fsSL','--retry','2','--connect-timeout','12','--max-time','60',url],
+                {encoding:'utf8', timeout:65000, maxBuffer:1024*1024});
+              if (list.status === 0) {
+                for (const [i,line] of list.stdout.split(/\r?\n/).entries()) {
+                  const p = parseProxyLine(line,i+1);
+                  if (p && p.valid) proxies.push(p);
+                }
+                console.log('[proxy] valid_count=' + proxies.length);
+              } else {
+                console.log('[proxy] download_failed; curl_exit=' + list.status);
+              }
+            } else {
+              console.log('[proxy] WEBSHARE_PROXY_LIST_URL not configured');
+            }
+            const modes = [{name:'github-direct', p:null},
+              ...proxies.slice(0,2).map((p,i)=>({name:'webshare-'+(i+1),p}))];
+            for (const mode of modes) {
+              for (const url of ['https://dashboard.katabump.com/auth/login',
+                'https://challenges.cloudflare.com/turnstile/v0/api.js',
+                'https://api.ipify.org']) {
+                runCurl(mode.name,url,mode.p);
+              }
+              await probeBrowser(mode.name,mode.p);
+            }
+            console.log('[diag] complete; no credentials, captcha interactions, or renew requests');
+          })().catch(e => { console.error('[diag] unexpected_error=' + e.name); process.exitCode=1; });
+          NODE
